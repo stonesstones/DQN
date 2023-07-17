@@ -1,77 +1,229 @@
 import numpy as np
 from dm_control import suite
+import torch
+import torchvision
+import torchvision.transforms as T
 
-class DMEnv:
+def make_env(config):
+    if config.domain == "normal":
+        return Env(config)
+    elif config.domain == "autostop":
+        return AutoStopEnv(config)
+    elif config.domain == "sparse":
+        return SparseEnv(config)
+    elif config.domain == "mnist":
+        return MnistEnv(config)
+    else:
+        raise NotImplementedError
+
+class Env:
     def __init__(self, config) -> None:
         self._config = config
-        self._env = suite.load(domain_name=config.domain, task_name=config.task)
-        self._obs_space = np.linspace(-1, 1, self._config.obs_discrete+1)[1:-1]
-        self._act_space = np.linspace(self._env.action_spec().minimum[0], 
-                                     self._env.action_spec().maximum[0], 
-                                     self._config.act_discrete)
+        self._obs_space = config.N
+        self._act_space = config.N - 1
+        self._action = np.array([self._digitized_action(index) for index in np.arange(0, 2**self._act_space)])
 
-        self._digitized_obs = np.arange(self._config.obs_discrete**2)
-        self._digitized_act = np.arange(self._config.act_discrete)
-        
-    
     @property
     def obs_spec(self):
-        return int(self._config.obs_discrete**2)
+        return int(self._obs_space)
     @property
     def act_spec(self):
-        return int(self._config.act_discrete)
+        return 2**self._act_space
+    # 2**self._act_space
     
     def reset(self):
-        obs = self._env.reset()
-        self._env.physics.named.data.qpos["hinge"] = 0.
-        obs = self._env.step(0)
-        reward = self._get_reward(obs.observation)
-        digitized_obs_index = self._digitize_obs(obs.observation)
-        digitized_obs = np.zeros(self._config.obs_discrete**2)
-        digitized_obs[digitized_obs_index] = 1
-        return digitized_obs, None, None, None
-
-    def _get_reward(self, obs):
-        d = self._config.obs_discrete
-        vec, vel = obs['orientation'], obs['velocity']
-        rad = np.arctan2(vec[1], vec[0])
-        normalized_rad = rad / np.pi # [-1, 1]
-        normalized_vel = np.clip(vel, -8, 8)/8
-        n_best = (d+1)/2.
-        n_rad = np.digitize(normalized_rad, np.linspace(-1, 1, d+1)[1:-1])
-        n_vel = np.digitize(normalized_vel, np.linspace(-1, 1, d+1)[1:-1])
-
-        return -(((n_rad-n_best)/d)**2 + 0.01*((n_vel-n_best)/d)**2)
-        # reward = -(normalized_rad**2 + 0.01*normalized_vel**2)
-        # if np.abs(normalized_rad) < 0.5:
-        #     reward += 1
-        # elif np.abs(normalized_rad) < 0.2:
-        #     reward += 2
-        # elif np.abs(normalized_rad) < 0.1:
-        #     reward += 3
-        # return reward
+        self.state = np.random.randint(0, 10, size=self._obs_space)
+        self.state[0] = np.random.randint(1, 10)
+        self.first_state_int = self._arr2int(self.state)
+        self.state_int = self.first_state_int
+        self.target = np.sort(self.state)
+        self.target_int = self._arr2int(self.target)
+        return self.state, None, None, self.state_int
 
     def step(self, action):
-        real_action = self._act_space[action]
-        obs = self._env.step(real_action)
-        obs = self._env.step(real_action)
-        reward = self._get_reward(obs.observation)
-        digitized_obs_index = self._digitize_obs(obs.observation)
-        digitized_obs = np.zeros(self._config.obs_discrete**2)
-        digitized_obs[digitized_obs_index] = 1
-        return digitized_obs, reward, None, None
-    
-    def _digitize_obs(self, obs):
-        vec, vel = obs['orientation'], obs['velocity']
-        rad = np.arctan2(vec[1], vec[0])
-        normalized_rad = rad / np.pi # [-1, 1]
-        normalized_vel = np.clip(vel ,-8,8)/8
-        digitized_rad = np.digitize(normalized_rad, self._obs_space)
-        digitized_vel = np.digitize(normalized_vel, self._obs_space)
-        return digitized_rad  + digitized_vel * self._config.obs_discrete
-    
+        action = self._action[action]
+        for index, a in enumerate(action):
+            if int(a) == 1:
+                tmp_i = self.state[index]
+                self.state[index] = self.state[index+1]
+                self.state[index+1] = tmp_i
+        self.state_int = self._arr2int(self.state)
+        reward, done = self._get_reward(self.state_int)
+        return self.state, reward, done, self.state_int
+
     def sample_action(self):
-        action = np.zeros(self._config.act_discrete)
-        index = np.random.randint(0, self._config.act_discrete)
-        action[index] = 1
-        return action
+        return np.random.randint(0, 2**self._act_space)
+
+    def _digitized_action(self, action_index):
+        index_str = bin(action_index)[2:]
+        return np.array([int(i) for i in index_str.zfill(self._act_space)])
+
+    def _get_reward(self, state_int):
+        diff = np.abs(self.target_int - state_int)
+        if diff == 0:
+            return 1, True
+        else:
+            return -2/(self._obs_space*(self._obs_space - 1)), False
+
+    def _arr2int(self, arr):
+        return int("".join([str(i) for i in arr]))
+
+class AutoStopEnv(Env):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+
+    @property
+    def act_spec(self):
+        return 2**self._act_space + 1
+
+    def reset(self):
+        self.time = 0
+        self.state = np.random.randint(0, 10, size=self._obs_space)
+        self.state[0] = np.random.randint(1, 10)
+        self.first_state_int = self._arr2int(self.state)
+        self.state_int = self.first_state_int
+        self.target = np.sort(self.state)
+        self.target_int = self._arr2int(self.target)
+        return self.state, None, None, self.state_int
+
+    def step(self, action):
+        terminate = (action == torch.tensor(2**self._act_space))
+        if terminate:
+            self.state_int = self._arr2int(self.state)
+            reward, done = self._get_reward(self.state_int)
+        else:
+            action = self._action[action]
+            for index, a in enumerate(action):
+                if int(a) == 1:
+                    tmp_i = self.state[index]
+                    self.state[index] = self.state[index+1]
+                    self.state[index+1] = tmp_i
+            self.state_int = self._arr2int(self.state)
+            reward, done = 0, False
+        return self.state, reward, done, self.state_int
+    def sample_action(self):
+        return np.random.randint(0, 2**self._act_space+1)
+
+    def _get_reward(self, state_int):
+        diff = np.abs(self.target_int - state_int)
+        if diff == 0:
+            return 1, True
+        else:
+            return 0, True
+
+class SparseEnv(Env):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        # self._config = config
+        # self._obs_space = config.N
+        # self._act_space = config.N - 1
+        # self._action = np.array([self._digitized_action(index) for index in np.arange(0, 2**(self._act_space-1))])
+        self._time_limit = config.time_limit
+    
+    def reset(self):
+        self.time = 0
+        self.state = np.random.randint(0, 10, size=self._obs_space)
+        self.state[0] = np.random.randint(1, 10)
+        self.first_state_int = self._arr2int(self.state)
+        self.state_int = self.first_state_int
+        self.target = np.sort(self.state)
+        self.target_int = self._arr2int(self.target)
+        return self.state, None, None, self.state_int
+
+    def step(self, action):
+        action = self._action[action]
+        for index, a in enumerate(action):
+            if int(a) == 1:
+                tmp_i = self.state[index]
+                self.state[index] = self.state[index+1]
+                self.state[index+1] = tmp_i
+        self.state_int = self._arr2int(self.state)
+        reward, done = self._get_reward(self.state_int)
+        if self.time >= self._time_limit:
+            done = True
+            self.time = 0
+        else:
+            self.time += 1
+        return self.state, reward, done, self.state_int
+
+    # def sample_action(self):
+    #     return np.random.randint(0, 2**self._act_space)
+
+    # def _digitized_action(self, action_index):
+    #     index_str = bin(action_index)[2:]
+    #     return np.array([int(i) for i in index_str.zfill(self._act_space)])
+
+    def _get_reward(self, state_int):
+        diff = np.abs(self.target_int - state_int)
+        if diff == 0:
+            return 1, True
+        else:
+            return 0, False
+
+    # def _arr2int(self, arr):
+    #     return int("".join([str(i) for i in arr]))
+
+class MnistEnv(Env):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.data = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=T.ToTensor())
+        # self.dataloader = torch.utils.data.DataLoader(self.data, batch_size=64)
+        self._config = config
+        self._obs_space = config.N
+        self._act_space = config.N - 1
+        self._action = np.array([self._digitized_action(index) for index in np.arange(0, 2**self._act_space)])
+
+    @property
+    def obs_spec(self):
+        return int(self._obs_space)
+    @property
+    def act_spec(self):
+        return 1
+    
+    def reset(self):
+        self.state = np.random.randint(0, 10, size=self._obs_space)
+        self.state[0] = np.random.randint(1, 10)
+        self.first_state_int = self._arr2int(self.state)
+        self.state_int = self.first_state_int
+        self.target = np.sort(self.state)
+        self.target_int = self._arr2int(self.target)
+        return self.state, None, None, self.state_int
+
+    def step(self, action):
+        action = self._action[action]
+        for index, a in enumerate(action):
+            if int(a) == 1:
+                tmp_i = self.state[index]
+                self.state[index] = self.state[index+1]
+                self.state[index+1] = tmp_i
+        self.state_int = self._arr2int(self.state)
+        reward, done = self._get_reward(self.state_int)
+        return self.state, reward, done, self.state_int
+
+    def sample_action(self):
+        return np.random.randint(0, 2**self._act_space)
+
+    def _digitized_action(self, action_index):
+        index_str = bin(action_index)[2:]
+        return np.array([int(i) for i in index_str.zfill(self._act_space)])
+
+    def _get_reward(self, state_int):
+        diff = np.abs(self.target_int - state_int)
+        if diff == 0:
+            return 1, True
+        else:
+            return -2/(self._obs_space*(self._obs_space - 1)), False
+
+    def _arr2int(self, arr):
+        return int("".join([str(i) for i in arr]))
+
+def main():
+    import dataclasses
+    @dataclasses.dataclass
+    class EnvConfig:
+        domain: str = "mnist"
+        N: int = 6
+        time_limit: int = 100
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from env import DMEnv
+from env import make_env
 from model import DQN
 from replay import ReplayBuffer
 from dm_control import suite
@@ -15,27 +15,29 @@ import time
 
 @dataclasses.dataclass
 class EnvConfig:
-    domain:str ='pendulum'
-    task: str = 'swingup'
-    act_discrete = 4
-    obs_discrete = 16
+    domain: str = "autostop"
+    N: int = 6
+    time_limit: int = 100
+
 
 @dataclasses.dataclass
 class Args:
     lr:float = 1e-4
     replay_capacity:int = int(10e6)
-    start_step:int = 2000
+    start_step:int = 10000
     batch_size:int = 128
-    # horizon:int = 8
     gamma:float = 0.99
-    eps_start:float = 0.9
+    eps_start:float = 0.95
     eps_end:float = 0.05
     eps_decay:float = 8000
     tau:float = 0.005
     episodes:int = int(10e4)
     restore: bool = False
-    episode_length: int = 200
+    episode_length: int = 100
     should_update_target: int = 500
+    eval_times: int = 100
+    eval_interval: int = 1000
+    log_interval: int = 100
 
 
 class Agent:
@@ -45,77 +47,47 @@ class Agent:
         self.obs_spec = obs_spec
         self.act_spec = act_spec
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.memory = ReplayBuffer(args.replay_capacity, obs_spec, act_spec, args.batch_size)
+        self.memory = ReplayBuffer(args.replay_capacity, obs_spec, 1, args.batch_size)
         self._build_model()
         if args.restore:
             self._restore()
 
-    def collect_random_episodes(self, env:DMEnv, logger:Logger, episodes:int):
+    def collect_random_episodes(self, env, logger:Logger, collect_step:int):
         total_ep_reward = []
-        for i in range(episodes):
+        ep_i = 0
+        while True:
             ep_reward = 0
-            state, _, _, _ = env.reset()
-            state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            state, _, _, state_int = env.reset()
+            state = torch.tensor(state, dtype=torch.float32, device=self.device)
             for step in range(self.args.episode_length):
-                action = torch.tensor(env.sample_action()[None, ...], device=self.device, dtype=torch.long).max(1)[1]
-                obs, reward, terminated, truncated = env.step(action)
+                action = torch.tensor(env.sample_action(), device=self.device, dtype=torch.long)
+                state, reward, done, state_int = env.step(action)
                 ep_reward += reward
-                done = terminated or truncated
-
                 if step == self.args.episode_length - 1:
                     done = True
-
-                next_state = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                next_state = torch.tensor(state, dtype=torch.float32, device=self.device)
                 
-                self.memory.add(logger.global_step, state, action.unsqueeze(0), reward, next_state, done)
-
+                self.memory.add(logger.global_step, state, action, reward, next_state, done)
                 state = next_state
                 logger.step()
-
                 if done:
                     break
+            if logger.global_step > collect_step:
+                break
             total_ep_reward.append(ep_reward)
         return np.array(total_ep_reward)
 
-    def collect_one_step(self, env:DMEnv, state, step_in_ep: int, logger:Logger):
+    def collect_one_step(self, env, state, step_in_ep: int, logger:Logger):
         action = self.select_action(env, state, logger.global_step)
-        obs, reward, terminated, truncated = env.step(action)
-        done = terminated or truncated
+        obs, reward, done, state_int = env.step(action)
         if step_in_ep == self.args.episode_length - 1:
             done = True
 
         next_state = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        self.memory.add(logger.global_step, state, action.unsqueeze(0), reward, next_state, done)
-        next_state = state
+        self.memory.add(logger.global_step, state, action, reward, next_state, done)
 
         return next_state, reward, done
-
-
-    def collect_one_episode(self, env:DMEnv, logger:Logger):
-        ep_reward = 0
-        state, _, _, _ = env.reset()
-        state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        for i in range(self.args.episode_length):
-            action = self.select_action(env, state, logger.global_step)
-            obs, reward, terminated, truncated = env.step(action)
-            ep_reward += reward
-            done = terminated or truncated
-
-            if i == self.args.episode_length - 1:
-                done = True
-
-            next_state = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-            
-            self.memory.add(logger.global_step, state, action.unsqueeze(0), reward, next_state, done)
-            logger.step()
-
-            state = next_state
-
-            if done:
-                break
-
-        return ep_reward
 
     def loss(self, non_final_indices, next_state, state, action, reward):
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
@@ -128,9 +100,9 @@ class Agent:
         # on the "older" target_net; selecting their best reward with max(1)[0].
         # This is merged based on the mask, such that we'll have either the expected
         # state value or 0 in case the state was final.
-        next_state_values = torch.zeros(self.args.batch_size, device=self.device)
+        next_state_values = torch.zeros(state_action_values.shape[:-1], device=self.device)
         with torch.no_grad():
-            next_state_values[non_final_indices] = self.target_net(next_state[non_final_indices]).max(1)[0]
+            next_state_values[non_final_indices] = self.target_net(next_state[non_final_indices]).max(-1)[0]
         # Compute the expected Q values
         expected_state_action_values = (next_state_values * self.args.gamma) + reward
 
@@ -166,13 +138,17 @@ class Agent:
                 target_net_state_dict[key] = policy_net_state_dict[key]*self.args.tau + target_net_state_dict[key]*(1-self.args.tau)
             self.target_net.load_state_dict(target_net_state_dict)
 
-    def select_action(self, env, state, global_step):
-        if self._scheduler(global_step):
-            with torch.no_grad():
-                return self.policy_net(state).max(1)[1]
+    def select_action(self, env, state, global_step, explore=True):
+        if explore:
+            if self._scheduler(global_step):
+                with torch.no_grad():
+                    return self.policy_net(state).max(-1)[1][0]
+            else:
+                return torch.tensor(env.sample_action(), device=self.device, dtype=torch.long)
         else:
-            return torch.tensor(env.sample_action()[None, ...], device=self.device, dtype=torch.long).max(1)[1]
-        
+            with torch.no_grad():
+                return self.policy_net(state).max(-1)[1][0]
+
     def _scheduler(self, global_step) -> bool:
         eps_threshold = self.args.eps_end + (self.args.eps_start - self.args.eps_end) * \
             np.exp(-1. * global_step / self.args.eps_decay)
@@ -200,73 +176,70 @@ def main():
     envconfig = EnvConfig()
     args = Args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = DMEnv(envconfig)
-    logdir = f"./logs/{time.strftime('%Y-%m-%d-%H-%M-%S')}"
+    env = make_env(envconfig)
+    logdir = f"./logs/{envconfig.domain}/{time.strftime('%Y-%m-%d-%H-%M-%S')}"
     logger = Logger(logdir)
     agent = Agent(args, env.obs_spec, env.act_spec)
 
-    collect_random_ep = np.ceil(args.start_step // args.episode_length).astype(np.int32)
-    initial_ep_reward = agent.collect_random_episodes(env, logger, collect_random_ep)
+    initial_ep_reward = agent.collect_random_episodes(env, logger, args.start_step)
     print(f"initial_ep_reward: {initial_ep_reward}")
 
     for i_episode in range(args.episodes):
         # Initialize the environment and get it's state
         ep_reward = 0
+        t = 0
         state, _, _, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        for t in count():
+        while True:
             state, reward, done = agent.collect_one_step(env, state, t, logger)
             ep_reward += reward
-
             # Perform one step of the optimization (on the policy network)
-            if (logger.global_step + 1) % 100 == 0:
-                loss = agent.train_one_batch()
+            loss = agent.train_one_batch()
+            if logger.global_step % args.log_interval == 0:
                 logs = OrderedDict()
                 logs.update({'loss': loss})
-                # print(f"loss: {loss}")
                 logger.add_scalars(logs)
-            
-            if (logger.global_step + 1) % 16 == 0:
-                agent.update_target_net()
-
+            agent.update_target_net()
             logger.step()
-
+            t += 1
             if done:
                 break
-        if (i_episode + 1) % 1000 == 0:
-            img_arr = []
-            state, _, _, _ = env.reset()
-            state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            img_arr.append(env._env.physics.render(height=480, width=640, camera_id=0))
-            for i in range(200):
-                action = agent.select_action(env, state, logger.global_step)
-                state, reward, terminated, truncated = env.step(action)
-                img_arr.append(env._env.physics.render(height=480, width=640,camera_id=0))
-                state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-                # logger.add_scalars({'eval_reward': reward}, i)
-                # logger.add_scalars({'eval_action': action}, i)
-            logger.log_video(img_arr)
+
+        # for train log
         logs = OrderedDict()
         logs.update({'reward': ep_reward})
         logger.add_scalars(logs)
         if i_episode % 100 == 0:
             print(f"\n############## {logger.global_step} #################")
-            print(f"Episode {i_episode} finished after {t+1} timesteps")
+            print(f"Episode {i_episode} finished after {t} timesteps")
             print(f"Episode reward: {ep_reward}")
+            print(f"first state: {env.first_state_int}, last state: {env.state_int}, answer: {env.target_int}")
             print("######################################################\n")
 
-    img_arr = []
-    state, _, _, _ = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-    img_arr.append(env._env.physics.render(height=480, width=640, camera_id=0))
-    for i in range(200):
-        action = agent.select_action(env, state, logger.global_step)
-        state, reward, terminated, truncated = env.step(action)
-        img_arr.append(env._env.physics.render(height=480, width=640,camera_id=0))
-        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        # logger.add_scalars({'eval_reward': reward}, i)
-        # logger.add_scalars({'eval_action': action}, i)
-    logger.log_video(img_arr)
+        # for eval
+        if (i_episode) % args.eval_interval == 0:
+            correct_num = 0
+            total_steps = 0
+            for _ in range(args.eval_times):
+                state, _, _, state_int = env.reset()
+                state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+                for i in range(args.episode_length):
+                    action = agent.select_action(env, state, logger.global_step, explore=False)
+                    state, reward, done, state_int = env.step(action)
+                    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+                    if done:
+                        if state_int == env.target_int:
+                            correct_num += 1
+                        total_steps += i
+                        break
+                    if i == args.episode_length - 1:
+                        total_steps += i
+            average_steps = total_steps / args.eval_times
+            accuracy = correct_num / args.eval_times
+            logs = OrderedDict()
+            print(f"average_steps: {average_steps}, accuracy: {accuracy}")
+            logs.update({'average_steps': average_steps, 'accuracy': accuracy})
+            logger.add_scalars(logs, i_episode)
 
 if __name__ == "__main__":
     main()
